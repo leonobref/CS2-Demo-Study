@@ -697,12 +697,16 @@ def plot_win_rates(data: dict, output_dir: Path = None):
     # 3. Win rate por win_reason
     ax = axes[2]
     if "win_reason_label" in rounds.columns:
-        wr = rounds.groupby(["win_reason_label","winner_team"]).size().unstack(fill_value=0)
-        wr.plot(kind="barh", ax=ax,
-                color=[CT_COLOR, T_COLOR], edgecolor="white", linewidth=0.3)
-        ax.set_xlabel("Rounds")
-        ax.set_title("Rounds por tipo de vitória")
-        ax.legend(title="Time", fontsize=8)
+        wr = rounds.dropna(subset=["winner_team"]).groupby(["win_reason_label","winner_team"]).size().unstack(fill_value=0)
+        if not wr.empty and not wr.select_dtypes("number").empty:
+            wr.plot(kind="barh", ax=ax,
+                    color=[CT_COLOR, T_COLOR], edgecolor="white", linewidth=0.3)
+            ax.set_xlabel("Rounds")
+            ax.set_title("Rounds por tipo de vitória")
+            ax.legend(title="Time", fontsize=8)
+        else:
+            ax.set_title("Rounds por tipo de vitória\n(sem dados de winner_team)")
+            ax.axis("off")
 
     plt.tight_layout()
     _save(fig, output_dir, "08_win_rates")

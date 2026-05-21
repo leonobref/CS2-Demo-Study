@@ -68,7 +68,7 @@ PLAYER_PROPS = [
 ECONOMY_PROPS = [
     "balance", "current_equip_value",
     "round_start_equip_value", "has_helmet",
-    "has_defuser", "active_weapon",
+    "has_defuser", "active_weapon", "team_num",
 ]
 
 # =============================================================================
@@ -213,14 +213,11 @@ def extract_rounds(parser: DemoParser) -> pd.DataFrame:
 
                 winner_raw = row_re.get("winner", None)
                 if winner_raw is not None and pd.notna(winner_raw):
-                    try:
-                        winner_raw = int(winner_raw)
-                    except (ValueError, TypeError):
-                        winner_raw = None
-                    if winner_raw is not None and winner_raw == 2:
+                    w = str(winner_raw).strip()
+                    if w in ("T", "2"):
                         winner_team = "T"
                         t_score += 1
-                    elif winner_raw is not None and winner_raw == 3:
+                    elif w in ("CT", "3"):
                         winner_team = "CT"
                         ct_score += 1
 

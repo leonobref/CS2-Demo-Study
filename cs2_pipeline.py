@@ -349,6 +349,10 @@ def _insert_demo(engine, demo_path: str, tick_rate: int, chunk_size: int) -> dic
         economy  = data["economy"]
         ticks    = data["ticks"]
 
+        # Drop coaches/spectators (team_num 0 or 1 — only 2=T and 3=CT are players)
+        if not ticks.empty and "team" in ticks.columns:
+            ticks = ticks[ticks["team"].isin([2, 3])]
+
         now = pd.Timestamp.utcnow().isoformat()
 
         # ── 2. Inserir match ─────────────────────────────────────────────────
