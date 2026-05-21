@@ -9,7 +9,7 @@ Visualizações e estatísticas cobertas:
   - Histogramas de distribuição
   - Boxplots por grupo (time, buy_type, round)
   - Scatter plots (ex: equip_value vs win_rate)
-  - Heatmap de posicionamento sobreposto ao mapa
+  - Heatmap de posicionamento por mapa (dust2, mirage, nuke) com log-norm
   - Heatmap de correlação entre variáveis
   - Distribuição de granadas por tipo e área
   - Vantagem econômica por round
@@ -28,6 +28,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -578,7 +579,94 @@ def plot_positioning_heatmap(data: dict, team: str = "CT",
 
 
 # =============================================================================
-# 8. ECONOMIA POR ROUND
+# 8. HEATMAP DE POSICIONAMENTO POR MAPA
+# =============================================================================
+
+MAP_DISPLAY = {
+    "de_dust2":  "Dust II",
+    "de_mirage": "Mirage",
+    "de_nuke":   "Nuke",
+}
+
+HEATMAP_MAPS = list(MAP_DISPLAY.keys())
+
+
+def plot_map_heatmaps(db_path: str, output_dir: Path = None):
+    """
+    Heatmap de posicionamento 2D por mapa (dust2, mirage, nuke), separado por time.
+    Uma figura por mapa com dois painéis: CT (azul) e T (vermelho).
+    Usa log-normalização para realçar hot spots sem suprimir áreas menos visitadas.
+    """
+    log.info("🗺  Gerando heatmaps por mapa...")
+
+    placeholders = ",".join(f"'{m}'" for m in HEATMAP_MAPS)
+    con = sqlite3.connect(db_path)
+    df = pd.read_sql(f"""
+        SELECT pt.pos_x, pt.pos_y, pt.team_label, m.map_name
+        FROM player_ticks pt
+        JOIN matches m ON pt.match_id = m.id
+        WHERE m.map_name IN ({placeholders})
+          AND pt.alive = 1
+          AND pt.pos_x IS NOT NULL
+          AND pt.pos_y IS NOT NULL
+    """, con)
+    con.close()
+
+    if df.empty:
+        log.warning("  Sem dados de posicionamento para os mapas selecionados.")
+        return
+
+    available = [m for m in HEATMAP_MAPS if m in df["map_name"].values]
+    if not available:
+        log.warning("  Nenhum dos mapas alvo encontrado no banco.")
+        return
+
+    for map_name in available:
+        map_df = df[df["map_name"] == map_name]
+        display = MAP_DISPLAY[map_name]
+
+        # Bounds from data, clipping extreme outliers
+        x_lo, x_hi = map_df["pos_x"].quantile([0.002, 0.998])
+        y_lo, y_hi = map_df["pos_y"].quantile([0.002, 0.998])
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle(f"Heatmap de Posicionamento — {display}", fontsize=14, fontweight="bold")
+
+        teams = [("CT", "Blues"), ("T", "Reds")]
+        for ax, (team, cmap) in zip(axes, teams):
+            team_df = map_df[map_df["team_label"] == team]
+
+            if team_df.empty:
+                ax.set_title(f"{team} — sem dados")
+                ax.axis("off")
+                continue
+
+            if len(team_df) > 200_000:
+                team_df = team_df.sample(200_000, random_state=42)
+
+            counts, xedges, yedges, img = ax.hist2d(
+                team_df["pos_x"], team_df["pos_y"],
+                bins=100,
+                range=[[x_lo, x_hi], [y_lo, y_hi]],
+                cmap=cmap,
+                norm=mcolors.LogNorm(),
+            )
+            fig.colorbar(img, ax=ax, label="Ticks (log)")
+
+            n_rounds = map_df["team_label"].notna().sum()  # proxy
+            ax.set_title(f"Time {team}  ({len(team_df):,} ticks)", fontsize=11)
+            ax.set_xlabel("Posição X")
+            ax.set_ylabel("Posição Y")
+            ax.set_aspect("equal")
+
+        plt.tight_layout()
+        fname = f"09_heatmap_{map_name}"
+        _save(fig, output_dir, fname)
+        log.info(f"  ✅ {display}: {len(map_df):,} ticks plotados")
+
+
+# =============================================================================
+# 10. ECONOMIA POR ROUND
 # =============================================================================
 
 def plot_economy_timeline(data: dict, output_dir: Path = None):
@@ -638,7 +726,7 @@ def plot_economy_timeline(data: dict, output_dir: Path = None):
 
 
 # =============================================================================
-# 9. WIN RATE POR CONTEXTO
+# 11. WIN RATE POR CONTEXTO
 # =============================================================================
 
 def plot_win_rates(data: dict, output_dir: Path = None):
@@ -734,6 +822,7 @@ def run_eda(db_path: str, match_id: int = None, output_dir: str = None):
     plot_grenades(data, out)
     plot_positioning_heatmap(data, team="CT", output_dir=out)
     plot_positioning_heatmap(data, team="T",  output_dir=out)
+    plot_map_heatmaps(db_path, out)
     plot_economy_timeline(data, out)
     plot_win_rates(data, out)
 
