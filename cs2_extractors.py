@@ -234,6 +234,14 @@ def extract_rounds(parser: DemoParser) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
+
+    # Drop warmup, knife, and aborted rounds that have no determined winner
+    before = len(df)
+    df = df.dropna(subset=["winner_team"])
+    dropped = before - len(df)
+    if dropped:
+        log.info(f"  🧹 {dropped} round(s) sem vencedor removidos (warmup/knife/abortado)")
+
     log.info(f"  ✅ {len(df)} rounds extraídos")
     return df
 

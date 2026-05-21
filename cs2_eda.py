@@ -420,6 +420,7 @@ def plot_scatter(data: dict, output_dir: Path = None):
         merged = ct.merge(t, on=["match_id","round_num"]) \
                    .merge(rounds[["match_id","round_num","winner_team"]], on=["match_id","round_num"])
 
+        merged = merged.dropna(subset=["winner_team"])
         colors = merged["winner_team"].map({"CT": CT_COLOR, "T": T_COLOR})
         ax.scatter(merged["t_equip"], merged["ct_equip"],
                    c=colors, alpha=0.6, s=40, edgecolors="white", linewidths=0.4)
