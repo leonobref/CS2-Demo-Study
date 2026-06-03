@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS players (
 CREATE TABLE IF NOT EXISTS match_players (
     match_id        INTEGER     NOT NULL REFERENCES matches(id)  ON DELETE CASCADE,
     steam_id        TEXT        NOT NULL REFERENCES players(steam_id),
-    team_label      TEXT,
+    team_label      TEXT,       -- lado inicial: 'T' ou 'CT'
+    team_name       TEXT,       -- nome real do time: ex. 'FaZe', 'FURIA'
     PRIMARY KEY (match_id, steam_id)
 );
 
@@ -63,8 +64,9 @@ CREATE TABLE IF NOT EXISTS rounds (
     tick_end        INTEGER,    -- round_officially_ended
 
     -- Resultado
-    winner_team     TEXT,       -- 'T' | 'CT'
-    win_reason      INTEGER,    -- código interno do CS2
+    winner_team      TEXT,      -- lado vencedor: 'T' | 'CT'
+    winner_team_name TEXT,      -- nome real do time vencedor: ex. 'FaZe', 'FURIA'
+    win_reason       INTEGER,   -- código interno do CS2
     win_reason_label TEXT,      -- 'ct_killed_all', 'bomb_defused', etc.
 
     -- Contagem de rounds vencidos até aqui
@@ -257,6 +259,7 @@ SELECT
     m.map_name,
     m.demo_file,
     r.winner_team,
+    r.winner_team_name,
     r.win_reason_label
 FROM kills k
 JOIN matches m ON k.match_id = m.id

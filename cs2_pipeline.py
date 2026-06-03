@@ -88,20 +88,22 @@ t_match_players = Table("match_players", metadata,
     Column("match_id",   Integer, nullable=False),
     Column("steam_id",   Text,    nullable=False),
     Column("team_label", Text),
+    Column("team_name",  Text),
 )
 
 t_rounds = Table("rounds", metadata,
-    Column("id",               Integer, primary_key=True, autoincrement=True),
-    Column("match_id",         Integer, nullable=False),
-    Column("round_num",        Integer),
-    Column("tick_start",       Integer),
-    Column("tick_freeze_end",  Integer),
-    Column("tick_end",         Integer),
-    Column("winner_team",      Text),
-    Column("win_reason",       Integer),
-    Column("win_reason_label", Text),
-    Column("t_score",          Integer),
-    Column("ct_score",         Integer),
+    Column("id",                Integer, primary_key=True, autoincrement=True),
+    Column("match_id",          Integer, nullable=False),
+    Column("round_num",         Integer),
+    Column("tick_start",        Integer),
+    Column("tick_freeze_end",   Integer),
+    Column("tick_end",          Integer),
+    Column("winner_team",       Text),
+    Column("winner_team_name",  Text),
+    Column("win_reason",        Integer),
+    Column("win_reason_label",  Text),
+    Column("t_score",           Integer),
+    Column("ct_score",          Integer),
 )
 
 t_kills = Table("kills", metadata,
@@ -260,6 +262,23 @@ def _is_processed(engine, demo_file: str) -> bool:
     return row is not None
 
 
+def _delete_match(engine, demo_file: str):
+    """Remove todos os dados de uma demo para permitir reprocessamento."""
+    with engine.connect() as c:
+        row = c.execute(
+            text("SELECT id FROM matches WHERE demo_file = :f"),
+            {"f": demo_file}
+        ).fetchone()
+        if row is None:
+            return
+        mid = row[0]
+        for tbl in ["economy", "kills", "grenades", "player_ticks", "rounds", "match_players"]:
+            c.execute(text(f"DELETE FROM {tbl} WHERE match_id = :mid"), {"mid": mid})
+        c.execute(text("DELETE FROM matches WHERE id = :mid"), {"mid": mid})
+        c.commit()
+    log.info(f"🗑  Dados de '{demo_file}' removidos (match_id={mid}).")
+
+
 def _upsert_player(conn, steam_id, name, now):
     """Upsert idempotente de jogador."""
     conn.execute(text("""
@@ -323,7 +342,8 @@ def _attach_round_id(df: pd.DataFrame, round_id_map: dict) -> pd.DataFrame:
 # INSERÇÃO DE UMA DEMO
 # =============================================================================
 
-def _insert_demo(engine, demo_path: str, tick_rate: int, chunk_size: int) -> dict:
+def _insert_demo(engine, demo_path: str, tick_rate: int, chunk_size: int,
+                 force: bool = False) -> dict:
     """
     Extrai e insere todos os dados de uma demo no banco.
     Retorna dict de status.
@@ -332,9 +352,12 @@ def _insert_demo(engine, demo_path: str, tick_rate: int, chunk_size: int) -> dic
     result    = {"demo": demo_file, "status": "ok", "rows": {}, "error": None}
 
     if _is_processed(engine, demo_file):
-        log.info(f"⏭  Pulando (já processada): {demo_file}")
-        result["status"] = "skipped"
-        return result
+        if force:
+            _delete_match(engine, demo_file)
+        else:
+            log.info(f"⏭  Pulando (já processada): {demo_file}")
+            result["status"] = "skipped"
+            return result
 
     t_total = time.time()
 
@@ -400,6 +423,12 @@ def _insert_demo(engine, demo_path: str, tick_rate: int, chunk_size: int) -> dic
             mp_cols = ["steam_id"] + (["team_label"] if "team_label" in ticks.columns else [])
             mp = ticks[mp_cols].drop_duplicates("steam_id").copy()
             mp["match_id"] = match_id
+            # Mapeia o lado inicial (T/CT) para o nome real do time
+            team_names = data.get("team_names", {})
+            if team_names and "team_label" in mp.columns:
+                mp["team_name"] = mp["team_label"].map(team_names)
+            else:
+                mp["team_name"] = None
             with engine.connect() as conn:
                 conn.execute(t_match_players.insert(), mp.to_dict("records"))
                 conn.commit()
@@ -470,6 +499,7 @@ def run_pipeline(
     tick_rate:  int = 8,
     workers:    int = 1,
     chunk_size: int = 50_000,
+    force:      bool = False,
 ):
     """
     Executa o pipeline completo em um arquivo ou diretório de demos.
@@ -496,12 +526,12 @@ def run_pipeline(
 
     if workers <= 1:
         for demo in demos:
-            r = _insert_demo(engine, str(demo), tick_rate, chunk_size)
+            r = _insert_demo(engine, str(demo), tick_rate, chunk_size, force=force)
             results.append(r)
     else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(_insert_demo, engine, str(d), tick_rate, chunk_size): d
+                ex.submit(_insert_demo, engine, str(d), tick_rate, chunk_size, force): d
                 for d in demos
             }
             for fut in as_completed(futures):
@@ -553,6 +583,7 @@ Exemplos:
     ap.add_argument("--tick-rate",  "-t", type=int, default=8,      help="Downsample de ticks (1=todos, padrão=8)")
     ap.add_argument("--workers",    "-w", type=int, default=1,      help="Workers paralelos (só PostgreSQL)")
     ap.add_argument("--chunk-size", "-c", type=int, default=50_000, help="Linhas por batch INSERT")
+    ap.add_argument("--force",      "-f", action="store_true",      help="Reprocessa demos já inseridas (apaga e re-insere)")
     args = ap.parse_args()
 
     run_pipeline(
@@ -561,6 +592,7 @@ Exemplos:
         tick_rate  = args.tick_rate,
         workers    = args.workers,
         chunk_size = args.chunk_size,
+        force      = args.force,
     )
 
 

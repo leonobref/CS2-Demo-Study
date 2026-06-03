@@ -28,6 +28,10 @@ log = logging.getLogger("cs2_extractors")
 # CONSTANTES
 # =============================================================================
 
+# Rounds por tempo no formato padrão CS2 (MR12) e overtime (MR3)
+HALF_ROUNDS   = 12
+OT_HALF_ROUNDS = 3
+
 # Código de vitória do CS2 → label legível
 WIN_REASON_MAP = {
     1:  "ct_killed_all",
@@ -134,6 +138,16 @@ def _classify_buy(equip_value: float) -> str:
         return "full_buy"
 
 
+def _sides_swapped(round_num: int) -> bool:
+    """True se os lados T/CT estão invertidos em relação ao primeiro tempo."""
+    reg = HALF_ROUNDS * 2
+    if round_num <= reg:
+        return round_num > HALF_ROUNDS
+    # Overtime: troca a cada OT_HALF_ROUNDS rounds; OT começa com lados do primeiro tempo
+    ot_half_idx = (round_num - reg - 1) // OT_HALF_ROUNDS
+    return ot_half_idx % 2 == 1
+
+
 def _assign_rounds(df: pd.DataFrame, rounds_df: pd.DataFrame, tick_col: str = "tick") -> pd.DataFrame:
     """Associa cada linha ao round correspondente pelo tick."""
     df = df.copy()
@@ -153,94 +167,207 @@ def _assign_rounds(df: pd.DataFrame, rounds_df: pd.DataFrame, tick_col: str = "t
 # 1. ROUNDS
 # =============================================================================
 
-def extract_rounds(parser: DemoParser) -> pd.DataFrame:
+def extract_team_names(parser: DemoParser) -> dict:
+    """
+    Detecta os nomes reais dos times para o primeiro tempo.
+
+    Retorna {"T": "NomeTime", "CT": "NomeTime"} ou {} se não disponível.
+    Os nomes são lidos de ticks iniciais (antes do halftime) para evitar
+    confusão com a troca de lados.
+    """
+    # Tentativa 1: evento cs_team_info (disponível em algumas demos)
+    df = _safe_event(parser, "cs_team_info", other=["teamid", "team_name", "clan_name"])
+    if not df.empty:
+        result = {}
+        for _, row in df.iterrows():
+            tid  = row.get("teamid")
+            name = row.get("clan_name") or row.get("team_name")
+            if pd.notna(name) and str(name).strip():
+                if str(tid) in ("2", "2.0"):
+                    result["T"] = str(name).strip()
+                elif str(tid) in ("3", "3.0"):
+                    result["CT"] = str(name).strip()
+        if len(result) == 2:
+            log.info(f"  🏆 Times detectados: T={result['T']} | CT={result['CT']}")
+            return result
+
+    # Tentativa 2: prop team_clan_name via ticks
+    try:
+        df = parser.parse_ticks(["team_num", "team_clan_name"])
+        if not df.empty:
+            # Usa apenas ticks do primeiro tempo para evitar troca de lados
+            min_tick = int(df["tick"].min())
+            cutoff   = min_tick + int(64 * 60 * 15)  # ~15 minutos de jogo
+            early    = df[df["tick"] <= cutoff]
+            result   = {}
+            for team_num, side in [(2, "T"), (3, "CT")]:
+                names = (
+                    early[early["team_num"] == team_num]["team_clan_name"]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                )
+                names = names[names != ""]
+                if not names.empty:
+                    result[side] = names.mode().iloc[0]
+            if len(result) == 2:
+                log.info(f"  🏆 Times detectados: T={result['T']} | CT={result['CT']}")
+                return result
+    except Exception as e:
+        log.debug(f"Prop 'team_clan_name' não disponível: {e}")
+
+    log.warning("  ⚠ Nomes de times não encontrados na demo.")
+    return {}
+
+
+def extract_rounds(parser: DemoParser, team_names: dict = None) -> pd.DataFrame:
     """
     Extrai resultado de cada round.
 
     Colunas retornadas:
         round_num, tick_start, tick_freeze_end, tick_end,
-        winner_team, win_reason, win_reason_label, t_score, ct_score
+        winner_team, winner_team_name, win_reason, win_reason_label,
+        t_score, ct_score
+
+    team_names: {"T": "NomeTime", "CT": "NomeTime"} para o primeiro tempo.
+    Se fornecido, winner_team_name é preenchido considerando a troca de lados
+    no halftime (round 13+) e overtime.
     """
     log.info("  → Extraindo rounds...")
 
     starts    = _safe_event(parser, "round_start")
-    ends      = _safe_event(parser, "round_officially_ended")
-    freeze    = _safe_event(parser, "round_freeze_end")
     round_end = _safe_event(parser, "round_end",
                     other=["winner", "reason", "legacy", "player_count"])
+    ends      = _safe_event(parser, "round_officially_ended")
+    freeze    = _safe_event(parser, "round_freeze_end")
 
-    if starts.empty or ends.empty:
+    if starts.empty or round_end.empty:
         log.warning("  ⚠ Eventos de round não encontrados.")
         return pd.DataFrame()
 
-    n = min(len(starts), len(ends))
+    # Detecta knife round pela presença de 2+ eventos begin_new_match.
+    # O primeiro dispara no início do knife, o segundo no início da partida real.
+    # round_start do round 1 real dispara ~1 tick ANTES do segundo begin_new_match,
+    # então usamos (último_tick - 32) como cutoff para absorver essa diferença.
+    begin_new_match_ev = _safe_event(parser, "begin_new_match")
+    knife_cutoff_tick  = 0
+    if not begin_new_match_ev.empty:
+        bnm_ticks = sorted(begin_new_match_ev["tick"].dropna().astype(int).tolist())
+        if len(bnm_ticks) >= 2:
+            knife_cutoff_tick = bnm_ticks[-1] - 32
+            log.info(f"  🔪 Knife round detectado — descartando rounds com tick_start < {knife_cutoff_tick}")
+
+    start_ticks  = sorted(starts["tick"].dropna().astype(int).tolist())
+    end_ticks    = sorted(ends["tick"].dropna().astype(int).tolist()) if not ends.empty else []
+    freeze_ticks = sorted(freeze["tick"].dropna().astype(int).tolist()) if not freeze.empty else []
+
     rows = []
-    t_score = ct_score = 0
-
-    for i in range(n):
-        raw_start = starts.iloc[i]["tick"]
-        raw_end   = ends.iloc[i]["tick"]
-        if pd.isna(raw_start) or pd.isna(raw_end):
+    for _, re_row in round_end.sort_values("tick").iterrows():
+        re_tick = re_row.get("tick")
+        if pd.isna(re_tick):
             continue
-        tick_start = int(raw_start)
-        tick_end   = int(raw_end)
+        re_tick = int(re_tick)
 
-        # Freeze end deste round
-        tick_freeze = None
-        if not freeze.empty:
-            candidates = freeze[(freeze["tick"] >= tick_start) & (freeze["tick"] <= tick_end)]
-            if not candidates.empty:
-                raw_freeze = candidates.iloc[0]["tick"]
-                tick_freeze = int(raw_freeze) if pd.notna(raw_freeze) else None
 
-        # Resultado do round
-        winner_team = win_reason_raw = win_reason_label = None
-        if not round_end.empty:
-            candidates = round_end[
-                (round_end["tick"] >= tick_start) & (round_end["tick"] <= tick_end)
-            ]
-            if not candidates.empty:
-                row_re = candidates.iloc[0]
+        # Most recent round_start before (or at) this round_end
+        prior_starts = [t for t in start_ticks if t <= re_tick]
+        if not prior_starts:
+            continue
+        tick_start = max(prior_starts)
 
-                reason_val = row_re.get("reason", None)
-                if reason_val is not None and pd.notna(reason_val):
-                    try:
-                        win_reason_raw   = int(reason_val)
-                        win_reason_label = WIN_REASON_MAP.get(win_reason_raw, f"reason_{win_reason_raw}")
-                    except (ValueError, TypeError):
-                        win_reason_raw   = None
-                        win_reason_label = str(reason_val)
+        # Descarta rounds que começaram antes do início oficial da partida (knife round)
+        if knife_cutoff_tick and tick_start < knife_cutoff_tick:
+            continue
 
-                winner_raw = row_re.get("winner", None)
-                if winner_raw is not None and pd.notna(winner_raw):
-                    w = str(winner_raw).strip()
-                    if w in ("T", "2"):
-                        winner_team = "T"
-                        t_score += 1
-                    elif w in ("CT", "3"):
-                        winner_team = "CT"
-                        ct_score += 1
+        # First round_officially_ended at or after round_end; fall back to round_end tick
+        # so the last round is never silently dropped
+        next_ends = [t for t in end_ticks if t >= re_tick]
+        tick_end = min(next_ends) if next_ends else re_tick
+
+        # First freeze_end that falls between this round's start and round_end
+        between_freezes = [t for t in freeze_ticks if tick_start < t <= re_tick]
+        tick_freeze = min(between_freezes) if between_freezes else None
+
+        # Parse winner
+        winner_team = None
+        winner_raw = re_row.get("winner", None)
+        if winner_raw is not None and pd.notna(winner_raw):
+            w = str(winner_raw).strip()
+            if w in ("T", "2"):
+                winner_team = "T"
+            elif w in ("CT", "3"):
+                winner_team = "CT"
+
+        # Parse win reason
+        win_reason_raw = win_reason_label = None
+        reason_val = re_row.get("reason", None)
+        if reason_val is not None and pd.notna(reason_val):
+            try:
+                win_reason_raw   = int(reason_val)
+                win_reason_label = WIN_REASON_MAP.get(win_reason_raw, f"reason_{win_reason_raw}")
+            except (ValueError, TypeError):
+                win_reason_raw   = None
+                win_reason_label = str(reason_val)
 
         rows.append({
-            "round_num":        i + 1,
             "tick_start":       tick_start,
             "tick_freeze_end":  tick_freeze,
             "tick_end":         tick_end,
             "winner_team":      winner_team,
             "win_reason":       win_reason_raw,
             "win_reason_label": win_reason_label,
-            "t_score":          t_score,
-            "ct_score":         ct_score,
         })
+
+    if not rows:
+        log.warning("  ⚠ Nenhum round extraído.")
+        return pd.DataFrame()
 
     df = pd.DataFrame(rows)
 
-    # Drop warmup, knife, and aborted rounds that have no determined winner
+    # If multiple round_end events fired for the same round_start (edge case),
+    # keep the first one.
+    df = (df.sort_values("tick_start")
+            .drop_duplicates(subset=["tick_start"])
+            .reset_index(drop=True))
+
+    # Drop warmup / knife / aborted rounds with no determined winner
     before = len(df)
-    df = df.dropna(subset=["winner_team"])
+    df = df[df["winner_team"].notna()].copy().reset_index(drop=True)
     dropped = before - len(df)
     if dropped:
         log.info(f"  🧹 {dropped} round(s) sem vencedor removidos (warmup/knife/abortado)")
+
+    # Assign sequential round numbers and accumulate scores AFTER filtering so
+    # that dropped warmup/aborted rounds never corrupt the running totals.
+    t_score = ct_score = 0
+    round_nums, t_scores, ct_scores = [], [], []
+    for _, row in df.iterrows():
+        if row["winner_team"] == "T":
+            t_score += 1
+        else:
+            ct_score += 1
+        round_nums.append(len(round_nums) + 1)
+        t_scores.append(t_score)
+        ct_scores.append(ct_score)
+
+    df["round_num"] = round_nums
+    df["t_score"]   = t_scores
+    df["ct_score"]  = ct_scores
+
+    # Resolve nome real do time vencedor considerando troca de lados no halftime
+    t_name  = (team_names or {}).get("T")
+    ct_name = (team_names or {}).get("CT")
+
+    def _resolve_team(row) -> str | None:
+        if not t_name or not ct_name or not row["winner_team"]:
+            return None
+        swapped = _sides_swapped(int(row["round_num"]))
+        if row["winner_team"] == "T":
+            return ct_name if swapped else t_name
+        else:
+            return t_name if swapped else ct_name
+
+    df["winner_team_name"] = df.apply(_resolve_team, axis=1)
 
     log.info(f"  ✅ {len(df)} rounds extraídos")
     return df
@@ -641,17 +768,19 @@ def extract_all(demo_path: str, tick_rate: int = 1) -> dict:
              f"Servidor: {header.get('server_name','?')}")
 
     # Ordem importa: rounds primeiro (usado por kills, grenades, economy)
-    rounds   = extract_rounds(parser)
-    kills    = extract_kills(parser, rounds)
-    grenades = extract_grenades(parser, rounds)
-    economy  = extract_economy(parser, rounds)
-    ticks    = extract_ticks(parser, rounds, tick_rate=tick_rate)
+    team_names = extract_team_names(parser)
+    rounds     = extract_rounds(parser, team_names=team_names)
+    kills      = extract_kills(parser, rounds)
+    grenades   = extract_grenades(parser, rounds)
+    economy    = extract_economy(parser, rounds)
+    ticks      = extract_ticks(parser, rounds, tick_rate=tick_rate)
 
     return {
-        "header":   header,
-        "rounds":   rounds,
-        "kills":    kills,
-        "grenades": grenades,
-        "economy":  economy,
-        "ticks":    ticks,
+        "header":     header,
+        "team_names": team_names,
+        "rounds":     rounds,
+        "kills":      kills,
+        "grenades":   grenades,
+        "economy":    economy,
+        "ticks":      ticks,
     }
