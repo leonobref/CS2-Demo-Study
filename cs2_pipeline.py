@@ -132,7 +132,6 @@ t_kills = Table("kills", metadata,
     Column("noscope",           Integer),
     Column("thrusmoke",         Integer),
     Column("distance",          Float),
-    Column("is_trade_kill",     Integer),
     Column("bomb_planted",      Integer),
 )
 

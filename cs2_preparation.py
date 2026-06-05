@@ -97,7 +97,7 @@ def clean_kills(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["victim_steam_id"].notna()]
 
     # Garante tipos corretos
-    for col in ["headshot", "penetrated", "noscope", "thrusmoke", "is_trade_kill"]:
+    for col in ["headshot", "penetrated", "noscope", "thrusmoke"]:
         if col in df.columns:
             df[col] = df[col].fillna(0).astype(int)
 
@@ -405,6 +405,31 @@ def feature_round_sequences(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.Dat
     return df
 
 
+def _compute_trade_kills(kills: pd.DataFrame, trade_window: int = 320) -> pd.DataFrame:
+    """
+    Adiciona a coluna is_trade_kill ao DataFrame de kills.
+    Uma kill é considerada trade quando ocorre dentro de `trade_window` ticks
+    após outra morte no mesmo round (padrão: 320 ticks ≈ 5s a 64 Hz).
+    """
+    if kills.empty or "tick" not in kills.columns or "round_num" not in kills.columns:
+        kills["is_trade_kill"] = 0
+        return kills
+
+    df = kills.sort_values("tick").reset_index(drop=True)
+    df["is_trade_kill"] = 0
+    for idx, row in df.iterrows():
+        if idx == 0:
+            continue
+        prev = df[
+            (df.index < idx) &
+            (df["round_num"] == row["round_num"]) &
+            (df["tick"] >= row["tick"] - trade_window)
+        ]
+        if not prev.empty:
+            df.at[idx, "is_trade_kill"] = 1
+    return df
+
+
 def feature_kast(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.DataFrame:
     """
     KAST aproximado por jogador por partida.
@@ -494,6 +519,8 @@ def build_features(data: dict) -> dict:
     economy  = data.get("economy",  pd.DataFrame())
     rounds   = data.get("rounds",   pd.DataFrame())
     ticks    = data.get("ticks",    pd.DataFrame())
+
+    kills = _compute_trade_kills(kills)
 
     features = {
         **data,

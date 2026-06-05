@@ -209,7 +209,7 @@ def extract_team_names(parser: DemoParser) -> dict:
                 )
                 names = names[names != ""]
                 if not names.empty:
-                    result[side] = names.mode().iloc[0]
+                    result[side] = str(names.mode().iloc[0]).strip()
             if len(result) == 2:
                 log.info(f"  🏆 Times detectados: T={result['T']} | CT={result['CT']}")
                 return result
@@ -355,8 +355,15 @@ def extract_rounds(parser: DemoParser, team_names: dict = None) -> pd.DataFrame:
     df["ct_score"]  = ct_scores
 
     # Resolve nome real do time vencedor considerando troca de lados no halftime
-    t_name  = (team_names or {}).get("T")
-    ct_name = (team_names or {}).get("CT")
+    def _to_name(val) -> str | None:
+        if val is None:
+            return None
+        if isinstance(val, (list, pd.Series)):
+            val = val[0] if len(val) > 0 else ""
+        return str(val).strip() or None
+
+    t_name  = _to_name((team_names or {}).get("T"))
+    ct_name = _to_name((team_names or {}).get("CT"))
 
     def _resolve_team(row) -> str | None:
         if not t_name or not ct_name or not row["winner_team"]:
@@ -367,7 +374,10 @@ def extract_rounds(parser: DemoParser, team_names: dict = None) -> pd.DataFrame:
         else:
             return t_name if swapped else ct_name
 
-    df["winner_team_name"] = df.apply(_resolve_team, axis=1)
+    winner_names = []
+    for _, row in df.iterrows():
+        winner_names.append(_resolve_team(row))
+    df["winner_team_name"] = winner_names
 
     log.info(f"  ✅ {len(df)} rounds extraídos")
     return df
@@ -387,7 +397,7 @@ def extract_kills(parser: DemoParser, rounds_df: pd.DataFrame) -> pd.DataFrame:
         victim_steam_id, victim_name, victim_team, victim_x/y/z,
         assister_steam_id, assister_name,
         weapon, headshot, penetrated, noscope, thrusmoke, distance,
-        is_trade_kill, bomb_planted
+        bomb_planted
     """
     log.info("  → Extraindo kills...")
 
@@ -449,23 +459,6 @@ def extract_kills(parser: DemoParser, rounds_df: pd.DataFrame) -> pd.DataFrame:
 
     # Associa rounds
     df = _assign_rounds(df, rounds_df)
-
-    # Trade kill: morte dentro de 5 segundos (~320 ticks a 64hz) após outra morte
-    # no mesmo round
-    if "tick" in df.columns:
-        df = df.sort_values("tick").reset_index(drop=True)
-        trade_window = 320
-        df["is_trade_kill"] = 0
-        for idx, row in df.iterrows():
-            if idx == 0:
-                continue
-            prev = df[
-                (df.index < idx) &
-                (df["round_num"] == row["round_num"]) &
-                (df["tick"] >= row["tick"] - trade_window)
-            ]
-            if not prev.empty:
-                df.at[idx, "is_trade_kill"] = 1
 
     # Bomb planted (simplificado)
     df["bomb_planted"] = 0

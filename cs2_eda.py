@@ -79,7 +79,7 @@ def load_db(db_path: str, match_id: int = None) -> dict:
     filt = f" WHERE match_id = {match_id}" if match_id else ""
 
     data = {}
-    for t in ["matches","players","rounds","kills","grenades","economy","player_ticks"]:
+    for t in ["matches","players","rounds","kills","grenades","economy"]:
         try:
             data[t] = pd.read_sql(f"SELECT * FROM {t}{filt}", con)
         except Exception:
@@ -88,11 +88,41 @@ def load_db(db_path: str, match_id: int = None) -> dict:
     return data
 
 
+def _ticks_sample(db_path: str, cols: list, match_id: int = None, n: int = 500_000) -> pd.DataFrame:
+    """Sample ~n alive rows from player_ticks via rowid-modulo — no full-table sort."""
+    filt = f" AND match_id = {match_id}" if match_id else ""
+    col_str = ", ".join(cols)
+    con = sqlite3.connect(db_path)
+    try:
+        total = con.execute(
+            f"SELECT COUNT(*) FROM player_ticks WHERE 1=1{filt}"
+        ).fetchone()[0]
+        if total == 0:
+            return pd.DataFrame(columns=cols)
+        if total <= n:
+            df = pd.read_sql(
+                f"SELECT {col_str} FROM player_ticks WHERE alive = 1{filt}", con
+            )
+        else:
+            step = max(1, total // n)
+            df = pd.read_sql(
+                f"SELECT {col_str} FROM player_ticks"
+                f" WHERE rowid % {step} = 0 AND alive = 1{filt}"
+                f" LIMIT {n}",
+                con,
+            )
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        con.close()
+    return df
+
+
 # =============================================================================
 # 1. ESTATÍSTICAS DESCRITIVAS
 # =============================================================================
 
-def descriptive_stats(data: dict) -> pd.DataFrame:
+def descriptive_stats(data: dict, db_path: str = None, match_id: int = None) -> pd.DataFrame:
     """
     Gera tabela de estatísticas descritivas para as principais variáveis numéricas.
     Retorna DataFrame e imprime no terminal.
@@ -101,7 +131,6 @@ def descriptive_stats(data: dict) -> pd.DataFrame:
 
     kills = data.get("kills", pd.DataFrame())
     econ  = data.get("economy", pd.DataFrame())
-    ticks = data.get("player_ticks", pd.DataFrame())
 
     frames = []
 
@@ -139,8 +168,9 @@ def descriptive_stats(data: dict) -> pd.DataFrame:
                     "max":         round(s.max(), 1),
                 })
 
-    # Ticks
-    if not ticks.empty:
+    # Ticks — sampled from DB to avoid loading 200 M rows into RAM
+    if db_path:
+        ticks = _ticks_sample(db_path, ["hp", "speed"], match_id)
         for col in ["hp", "speed"]:
             if col in ticks.columns:
                 s = ticks[col].dropna()
@@ -253,7 +283,7 @@ def plot_distributions(data: dict, output_dir: Path = None):
 # 3. BOXPLOTS
 # =============================================================================
 
-def plot_boxplots(data: dict, output_dir: Path = None):
+def plot_boxplots(data: dict, output_dir: Path = None, db_path: str = None, match_id: int = None):
     """Boxplots comparativos por grupo."""
     log.info("📦 Gerando boxplots...")
 
@@ -295,19 +325,28 @@ def plot_boxplots(data: dict, output_dir: Path = None):
         ax.set_title("Equipamento por tipo de compra")
         ax.set_xticklabels(["Eco","Force","Half","Full"], rotation=0)
 
-    # 3. HP médio por time ao longo dos rounds
+    # 3. HP médio por time ao longo dos rounds — aggregated in SQL
     ax = axes[2]
-    ticks = data.get("player_ticks", pd.DataFrame())
-    if not ticks.empty and "hp" in ticks.columns and "team_label" in ticks.columns and "round_num" in ticks.columns:
-        sample = ticks[ticks["alive"] == 1].dropna(subset=["hp","team_label","round_num"])
-        sample = sample[sample["team_label"].isin(["T","CT"])]
-        # Agrega por round para não explodir o boxplot
-        hp_round = sample.groupby(["round_num","team_label"])["hp"].mean().reset_index()
-        sns.boxplot(data=hp_round, x="team_label", y="hp",
-                    palette=PALETTE, ax=ax, width=0.5, fliersize=2, linewidth=0.8)
-        ax.set_xlabel("Time")
-        ax.set_ylabel("HP médio por round")
-        ax.set_title("HP médio (jogadores vivos) por time")
+    if db_path:
+        filt = f" AND match_id = {match_id}" if match_id else ""
+        con = sqlite3.connect(db_path)
+        try:
+            hp_round = pd.read_sql(f"""
+                SELECT round_num, team_label, AVG(hp) AS hp
+                FROM player_ticks
+                WHERE alive = 1 AND team_label IN ('T', 'CT'){filt}
+                GROUP BY round_num, team_label
+            """, con)
+        except Exception:
+            hp_round = pd.DataFrame()
+        finally:
+            con.close()
+        if not hp_round.empty:
+            sns.boxplot(data=hp_round, x="team_label", y="hp",
+                        palette=PALETTE, ax=ax, width=0.5, fliersize=2, linewidth=0.8)
+            ax.set_xlabel("Time")
+            ax.set_ylabel("HP médio por round")
+            ax.set_title("HP médio (jogadores vivos) por time")
 
     plt.tight_layout()
     _save(fig, output_dir, "02_boxplots")
@@ -335,7 +374,6 @@ def plot_correlation(data: dict, output_dir: Path = None):
         hs_total    = ("headshot", "sum"),
         hs_rate     = ("headshot", "mean"),
         avg_dist    = ("distance", "mean"),
-        trades      = ("is_trade_kill", "sum"),
     ).reset_index()
 
     econ_ct = econ[econ["team_label"]=="CT"].groupby(["match_id","round_num"]).agg(
@@ -357,7 +395,7 @@ def plot_correlation(data: dict, output_dir: Path = None):
     merged["ct_wins"]    = (merged["winner_team"] == "CT").astype(int)
     merged["eco_adv_ct"] = merged["ct_equip"].fillna(0) - merged["t_equip"].fillna(0)
 
-    numeric_cols = ["kills_total","hs_rate","avg_dist","trades",
+    numeric_cols = ["kills_total","hs_rate","avg_dist",
                     "ct_equip","t_equip","eco_adv_ct","ct_rifles","t_rifles","ct_wins"]
     df_corr = merged[numeric_cols].dropna()
 
@@ -370,7 +408,7 @@ def plot_correlation(data: dict, output_dir: Path = None):
 
     labels = {
         "kills_total": "Kills/round", "hs_rate": "HS rate",
-        "avg_dist": "Dist. média", "trades": "Trade kills",
+        "avg_dist": "Dist. média",
         "ct_equip": "Equip CT", "t_equip": "Equip T",
         "eco_adv_ct": "Vant. Eco CT", "ct_rifles": "Rifles CT",
         "t_rifles": "Rifles T", "ct_wins": "Vitória CT",
@@ -525,34 +563,53 @@ def plot_grenades(data: dict, output_dir: Path = None):
 # 7. HEATMAP DE POSICIONAMENTO
 # =============================================================================
 
-def plot_positioning_heatmap(data: dict, team: str = "CT",
-                             round_num: int = None, output_dir: Path = None):
+def plot_positioning_heatmap(db_path: str, team: str = "CT",
+                             round_num: int = None, match_id: int = None,
+                             output_dir: Path = None):
     """
     Heatmap de posicionamento 2D sobreposto ao mapa.
     Separa por time, opcionalmente filtra por round.
+    Queries the DB directly with rowid-modulo sampling to stay under 200 K rows.
     """
     log.info(f"🗺  Gerando heatmap de posicionamento ({team})...")
 
-    ticks = data.get("player_ticks", pd.DataFrame())
-    if ticks.empty or "pos_x" not in ticks.columns:
-        log.warning("  Sem dados de posicionamento.")
-        return
-
-    df = ticks.copy()
-    df = df[df["team_label"] == team]
-    df = df[df["alive"] == 1]
-
+    filt_parts = [
+        f"team_label = '{team}'", "alive = 1",
+        "pos_x IS NOT NULL", "pos_y IS NOT NULL",
+    ]
+    if match_id:
+        filt_parts.append(f"match_id = {match_id}")
     if round_num:
-        df = df[df["round_num"] == round_num]
+        filt_parts.append(f"round_num = {round_num}")
+    where = " AND ".join(filt_parts)
 
-    df = df.dropna(subset=["pos_x","pos_y"])
+    n = 200_000
+    con = sqlite3.connect(db_path)
+    try:
+        total = con.execute(f"SELECT COUNT(*) FROM player_ticks WHERE {where}").fetchone()[0]
+        if total == 0:
+            log.warning("  Nenhum dado após filtros.")
+            con.close()
+            return
+        if total <= n:
+            df = pd.read_sql(f"SELECT pos_x, pos_y FROM player_ticks WHERE {where}", con)
+        else:
+            step = max(1, total // n)
+            df = pd.read_sql(
+                f"SELECT pos_x, pos_y FROM player_ticks"
+                f" WHERE rowid % {step} = 0 AND {where}"
+                f" LIMIT {n}",
+                con,
+            )
+    except Exception as e:
+        log.warning(f"  Erro ao carregar ticks: {e}")
+        df = pd.DataFrame()
+    finally:
+        con.close()
+
     if df.empty:
         log.warning("  Nenhum dado após filtros.")
         return
-
-    # Amostra para performance
-    if len(df) > 200_000:
-        df = df.sample(200_000, random_state=42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     title_suf = f" — Round {round_num}" if round_num else ""
@@ -582,48 +639,60 @@ def plot_positioning_heatmap(data: dict, team: str = "CT",
 # 8. HEATMAP DE POSICIONAMENTO POR MAPA
 # =============================================================================
 
-MAP_DISPLAY = {
-    "de_dust2":  "Dust II",
-    "de_mirage": "Mirage",
-    "de_nuke":   "Nuke",
-}
-
-HEATMAP_MAPS = list(MAP_DISPLAY.keys())
+def _map_display_name(map_name: str) -> str:
+    """Converte nome interno do mapa para exibição (ex: de_dust2 → Dust II)."""
+    known = {
+        "de_dust2":    "Dust II",
+        "de_mirage":   "Mirage",
+        "de_nuke":     "Nuke",
+        "de_inferno":  "Inferno",
+        "de_ancient":  "Ancient",
+        "de_anubis":   "Anubis",
+        "de_vertigo":  "Vertigo",
+        "de_overpass": "Overpass",
+        "de_cache":    "Cache",
+        "de_train":    "Train",
+    }
+    if map_name in known:
+        return known[map_name]
+    # fallback: remove prefixo "de_" e capitaliza
+    return map_name.removeprefix("de_").replace("_", " ").title()
 
 
 def plot_map_heatmaps(db_path: str, output_dir: Path = None):
     """
-    Heatmap de posicionamento 2D por mapa (dust2, mirage, nuke), separado por time.
-    Uma figura por mapa com dois painéis: CT (azul) e T (vermelho).
-    Usa log-normalização para realçar hot spots sem suprimir áreas menos visitadas.
+    Heatmap de posicionamento 2D por mapa, separado por time.
+    Gera um heatmap para cada mapa presente no banco de dados.
     """
     log.info("🗺  Gerando heatmaps por mapa...")
 
-    placeholders = ",".join(f"'{m}'" for m in HEATMAP_MAPS)
     con = sqlite3.connect(db_path)
-    df = pd.read_sql(f"""
+    # step=20 → ~5 % sample; keeps each map under ~500 K rows even with 100 M total ticks
+    df = pd.read_sql("""
         SELECT pt.pos_x, pt.pos_y, pt.team_label, m.map_name
         FROM player_ticks pt
         JOIN matches m ON pt.match_id = m.id
-        WHERE m.map_name IN ({placeholders})
-          AND pt.alive = 1
+        WHERE pt.alive = 1
           AND pt.pos_x IS NOT NULL
           AND pt.pos_y IS NOT NULL
+          AND pt.rowid % 20 = 0
     """, con)
     con.close()
 
     if df.empty:
-        log.warning("  Sem dados de posicionamento para os mapas selecionados.")
+        log.warning("  Sem dados de posicionamento no banco.")
         return
 
-    available = [m for m in HEATMAP_MAPS if m in df["map_name"].values]
+    available = sorted(df["map_name"].dropna().unique())
     if not available:
-        log.warning("  Nenhum dos mapas alvo encontrado no banco.")
+        log.warning("  Nenhum mapa encontrado no banco.")
         return
+
+    log.info(f"  Mapas encontrados: {', '.join(available)}")
 
     for map_name in available:
         map_df = df[df["map_name"] == map_name]
-        display = MAP_DISPLAY[map_name]
+        display = _map_display_name(map_name)
 
         # Bounds from data, clipping extreme outliers
         x_lo, x_hi = map_df["pos_x"].quantile([0.002, 0.998])
@@ -653,7 +722,6 @@ def plot_map_heatmaps(db_path: str, output_dir: Path = None):
             )
             fig.colorbar(img, ax=ax, label="Ticks (log)")
 
-            n_rounds = map_df["team_label"].notna().sum()  # proxy
             ax.set_title(f"Time {team}  ({len(team_df):,} ticks)", fontsize=11)
             ax.set_xlabel("Posição X")
             ax.set_ylabel("Posição Y")
@@ -814,14 +882,14 @@ def run_eda(db_path: str, match_id: int = None, output_dir: str = None):
     log.info(f"🔍 Iniciando EDA: {db_path}" + (f" | match_id={match_id}" if match_id else ""))
     data = load_db(db_path, match_id)
 
-    descriptive_stats(data)
+    descriptive_stats(data, db_path, match_id)
     plot_distributions(data, out)
-    plot_boxplots(data, out)
+    plot_boxplots(data, out, db_path, match_id)
     plot_correlation(data, out)
     plot_scatter(data, out)
     plot_grenades(data, out)
-    plot_positioning_heatmap(data, team="CT", output_dir=out)
-    plot_positioning_heatmap(data, team="T",  output_dir=out)
+    plot_positioning_heatmap(db_path, team="CT", match_id=match_id, output_dir=out)
+    plot_positioning_heatmap(db_path, team="T",  match_id=match_id, output_dir=out)
     plot_map_heatmaps(db_path, out)
     plot_economy_timeline(data, out)
     plot_win_rates(data, out)
