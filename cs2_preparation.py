@@ -41,19 +41,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # =============================================================================
 
 def load_raw(db_path: str) -> dict:
-    """Carrega todas as tabelas do banco em DataFrames."""
+    """Carrega tabelas do banco em DataFrames. player_ticks é excluído — use _ticks_sample() para amostras."""
     db_path = str(db_path)
     log.info(f"📂 Carregando dados de: {db_path}")
     con = sqlite3.connect(db_path)
 
     tables = {
-        "matches":      "SELECT * FROM matches",
-        "players":      "SELECT * FROM players",
-        "rounds":       "SELECT * FROM rounds",
-        "kills":        "SELECT * FROM kills",
-        "grenades":     "SELECT * FROM grenades",
-        "economy":      "SELECT * FROM economy",
-        "ticks":        "SELECT * FROM player_ticks",
+        "matches":  "SELECT * FROM matches",
+        "players":  "SELECT * FROM players",
+        "rounds":   "SELECT * FROM rounds",
+        "kills":    "SELECT * FROM kills",
+        "grenades": "SELECT * FROM grenades",
+        "economy":  "SELECT * FROM economy",
     }
 
     data = {}
@@ -68,6 +67,36 @@ def load_raw(db_path: str) -> dict:
 
     con.close()
     return data
+
+
+def _ticks_sample(db_path: str, cols: list, match_id: int = None, n: int = 500_000) -> pd.DataFrame:
+    """Sample ~n alive rows from player_ticks via rowid-modulo — no full-table sort."""
+    filt = f" AND match_id = {match_id}" if match_id else ""
+    col_str = ", ".join(cols)
+    con = sqlite3.connect(db_path)
+    try:
+        total = con.execute(
+            f"SELECT COUNT(*) FROM player_ticks WHERE 1=1{filt}"
+        ).fetchone()[0]
+        if total == 0:
+            return pd.DataFrame(columns=cols)
+        if total <= n:
+            df = pd.read_sql(
+                f"SELECT {col_str} FROM player_ticks WHERE alive = 1{filt}", con
+            )
+        else:
+            step = max(1, total // n)
+            df = pd.read_sql(
+                f"SELECT {col_str} FROM player_ticks"
+                f" WHERE rowid % {step} = 0 AND alive = 1{filt}"
+                f" LIMIT {n}",
+                con,
+            )
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        con.close()
+    return df
 
 
 # =============================================================================
@@ -189,7 +218,7 @@ def clean_ticks(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def clean(data: dict) -> dict:
-    """Aplica limpeza em todas as tabelas."""
+    """Aplica limpeza em todas as tabelas. player_ticks não é incluído — amostrado em build_features()."""
     log.info("🧹 Iniciando limpeza...")
     return {
         "matches":  data["matches"].copy(),
@@ -198,7 +227,6 @@ def clean(data: dict) -> dict:
         "kills":    clean_kills(data["kills"].copy()),
         "grenades": clean_grenades(data["grenades"].copy()),
         "economy":  clean_economy(data["economy"].copy()),
-        "ticks":    clean_ticks(data["ticks"].copy()),
     }
 
 
@@ -246,39 +274,35 @@ def feature_grenade_success(grenades: pd.DataFrame, kills: pd.DataFrame) -> pd.D
     """
     Taxa de sucesso de granadas por tipo.
     Métrica: proporção de granadas que precederam uma kill no mesmo round (janela 5s / 320 ticks).
+    Usa merge vetorizado em vez de iterrows.
     """
     if grenades.empty:
         return pd.DataFrame()
 
-    WINDOW = 320  # ticks (~5 segundos a 64hz)
+    WINDOW = 320
 
-    stats_rows = []
-    for (match_id, grenade_type), grp in grenades.groupby(["match_id", "grenade_type"]):
-        total = len(grp)
-        effective = 0
+    g = grenades.reset_index().rename(columns={"index": "_gidx"})
+    g["_tick_end"] = g["tick"] + WINDOW
 
-        if not kills.empty:
-            match_kills = kills[(kills["match_id"] == match_id)]
-            for _, g in grp.iterrows():
-                nearby_kill = match_kills[
-                    (match_kills["round_num"] == g.get("round_num", -1)) &
-                    (match_kills["tick"] >= g["tick"]) &
-                    (match_kills["tick"] <= g["tick"] + WINDOW)
-                ]
-                if not nearby_kill.empty:
-                    effective += 1
+    if not kills.empty:
+        k = kills[["match_id", "round_num", "tick"]].rename(columns={"tick": "_kill_tick"})
+        m = g.merge(k, on=["match_id", "round_num"], how="left")
+        m["_eff"] = (
+            (m["_kill_tick"] >= m["tick"]) & (m["_kill_tick"] <= m["_tick_end"])
+        ).astype(int)
+        eff_map = m.groupby("_gidx")["_eff"].max().fillna(0).astype(int)
+        g["_effective"] = g["_gidx"].map(eff_map).fillna(0).astype(int)
+    else:
+        g["_effective"] = 0
 
-        stats_rows.append({
-            "match_id":      match_id,
-            "grenade_type":  grenade_type,
-            "total":         total,
-            "effective":     effective,
-            "success_rate":  round(effective / total, 3) if total > 0 else 0.0,
-        })
+    result = g.groupby(["match_id", "grenade_type"]).agg(
+        total     = ("_gidx",      "count"),
+        effective = ("_effective", "sum"),
+    ).reset_index()
+    result["success_rate"] = (result["effective"] / result["total"].replace(0, 1)).round(3)
 
-    df = pd.DataFrame(stats_rows)
-    log.info(f"  ✅ feature_grenade_success: {len(df)} linhas")
-    return df
+    log.info(f"  ✅ feature_grenade_success: {len(result)} linhas")
+    return result
 
 
 def feature_economy_advantage(economy: pd.DataFrame) -> pd.DataFrame:
@@ -361,10 +385,12 @@ def feature_round_sequences(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.Dat
             ks_per_player = rk.groupby("attacker_steam_id").size()
             multi_kill_max = int(ks_per_player.max()) if not ks_per_player.empty else 0
 
-        # Clutch: 1 jogador de um time vs 2+ do outro
-        clutch = 0
-        if not rk.empty:
-            # Conta sobreviventes por time a cada kill
+        # Clutch: lone player (1vN, N≥2) who wins the round.
+        # clutch_vs = N at the moment the 1vN starts (0 = no successful clutch).
+        # A 1vN state that occurs mid-round but the lone player loses is NOT a clutch.
+        winner = r.get("winner_team")
+        clutch_vs = 0
+        if not rk.empty and winner in ("T", "CT"):
             t_alive  = 5
             ct_alive = 5
             for _, kill in rk.iterrows():
@@ -372,11 +398,12 @@ def feature_round_sequences(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.Dat
                     t_alive  = max(0, t_alive  - 1)
                 elif kill.get("victim_team") == "CT":
                     ct_alive = max(0, ct_alive - 1)
-                if t_alive == 1 and ct_alive >= 2:
-                    clutch = 1
+                # Detect 1vN and check if the lone player's team wins
+                if t_alive == 1 and ct_alive >= 2 and winner == "T":
+                    clutch_vs = ct_alive
                     break
-                if ct_alive == 1 and t_alive >= 2:
-                    clutch = 1
+                if ct_alive == 1 and t_alive >= 2 and winner == "CT":
+                    clutch_vs = t_alive
                     break
 
         # Duração do round
@@ -395,7 +422,7 @@ def feature_round_sequences(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.Dat
             "opening_wins_round": int(opening_team == r.get("winner_team")) if opening_team else None,
             "kill_count":         len(rk),
             "multi_kill_max":     multi_kill_max,
-            "clutch_situation":   clutch,
+            "clutch_vs":          clutch_vs,
             "duration_ticks":     duration,
             "duration_secs":      round(duration / 64, 1) if duration else None,
         })
@@ -407,34 +434,30 @@ def feature_round_sequences(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.Dat
 
 def _compute_trade_kills(kills: pd.DataFrame, trade_window: int = 320) -> pd.DataFrame:
     """
-    Adiciona a coluna is_trade_kill ao DataFrame de kills.
-    Uma kill é considerada trade quando ocorre dentro de `trade_window` ticks
-    após outra morte no mesmo round (padrão: 320 ticks ≈ 5s a 64 Hz).
+    Adiciona is_trade_kill: 1 quando a kill ocorre dentro de `trade_window` ticks
+    após qualquer outra morte no mesmo (match, round). Usa numpy por grupo — sem iterrows.
     """
     if kills.empty or "tick" not in kills.columns or "round_num" not in kills.columns:
         kills["is_trade_kill"] = 0
         return kills
 
-    df = kills.sort_values("tick").reset_index(drop=True)
-    df["is_trade_kill"] = 0
-    for idx, row in df.iterrows():
-        if idx == 0:
-            continue
-        prev = df[
-            (df.index < idx) &
-            (df["round_num"] == row["round_num"]) &
-            (df["tick"] >= row["tick"] - trade_window)
-        ]
-        if not prev.empty:
-            df.at[idx, "is_trade_kill"] = 1
+    df = kills.sort_values(["match_id", "round_num", "tick"]).reset_index(drop=True)
+    is_trade = np.zeros(len(df), dtype=np.int8)
+
+    for _, grp in df.groupby(["match_id", "round_num"], sort=False):
+        ticks = grp["tick"].values
+        idx   = grp.index.values
+        for i in range(1, len(ticks)):
+            if np.any(ticks[i] - ticks[:i] <= trade_window):
+                is_trade[idx[i]] = 1
+
+    df["is_trade_kill"] = is_trade
     return df
 
 
 def feature_kast(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.DataFrame:
     """
-    KAST aproximado por jogador por partida.
-    KAST = % de rounds onde o jogador fez Kill, Assist, Survived ou Trade.
-
+    KAST aproximado por jogador por partida — vetorizado.
     K = fez ao menos 1 kill no round
     A = fez ao menos 1 assist no round
     S = não morreu no round
@@ -443,41 +466,69 @@ def feature_kast(kills: pd.DataFrame, rounds: pd.DataFrame) -> pd.DataFrame:
     if kills.empty or rounds.empty:
         return pd.DataFrame()
 
-    all_players = pd.concat([
+    rounds_long = rounds[["match_id", "round_num"]].drop_duplicates()
+
+    # All players seen in this match (via kills or deaths)
+    players_per_match = pd.concat([
         kills[["match_id", "attacker_steam_id"]].rename(columns={"attacker_steam_id": "steam_id"}),
         kills[["match_id", "victim_steam_id"]].rename(columns={"victim_steam_id": "steam_id"}),
-    ]).drop_duplicates().dropna()
+    ]).drop_duplicates().dropna(subset=["steam_id"])
 
-    results = []
-    for (match_id, steam_id), _ in all_players.groupby(["match_id", "steam_id"]):
-        match_rounds = rounds[rounds["match_id"] == match_id]["round_num"].tolist()
-        if not match_rounds:
-            continue
+    # Cross product: every player × every round of their match
+    pr = players_per_match.merge(rounds_long, on="match_id", how="left")
 
-        kast_rounds = 0
-        for rnd in match_rounds:
-            rk = kills[(kills["match_id"] == match_id) & (kills["round_num"] == rnd)]
+    key = ["match_id", "round_num", "steam_id"]
 
-            K = int(steam_id in rk["attacker_steam_id"].values)
-            A = int("assister_steam_id" in rk.columns and steam_id in rk["assister_steam_id"].values)
-            S = int(steam_id not in rk["victim_steam_id"].values)
-            T = int(rk[rk["victim_steam_id"] == steam_id]["is_trade_kill"].sum() > 0
-                    if not rk.empty and "is_trade_kill" in rk.columns else 0)
+    K = (kills.groupby(["match_id", "round_num", "attacker_steam_id"]).size()
+              .gt(0).astype(int).reset_index(name="K")
+              .rename(columns={"attacker_steam_id": "steam_id"}))
 
-            if K or A or S or T:
-                kast_rounds += 1
+    D = (kills.groupby(["match_id", "round_num", "victim_steam_id"]).size()
+              .gt(0).astype(int).reset_index(name="D")
+              .rename(columns={"victim_steam_id": "steam_id"}))
 
-        results.append({
-            "match_id": match_id,
-            "steam_id": steam_id,
-            "rounds_total": len(match_rounds),
-            "kast_rounds":  kast_rounds,
-            "kast_pct":     round(kast_rounds / len(match_rounds) * 100, 1),
-        })
+    A = pd.DataFrame(columns=key + ["A"])
+    if "assister_steam_id" in kills.columns:
+        A = (kills.dropna(subset=["assister_steam_id"])
+                  .groupby(["match_id", "round_num", "assister_steam_id"]).size()
+                  .gt(0).astype(int).reset_index(name="A")
+                  .rename(columns={"assister_steam_id": "steam_id"}))
 
-    df = pd.DataFrame(results)
-    log.info(f"  ✅ feature_kast: {len(df)} linhas")
-    return df
+    T = pd.DataFrame(columns=key + ["T"])
+    if "is_trade_kill" in kills.columns:
+        T = (kills[kills["is_trade_kill"] == 1]
+                  .groupby(["match_id", "round_num", "victim_steam_id"]).size()
+                  .gt(0).astype(int).reset_index(name="T")
+                  .rename(columns={"victim_steam_id": "steam_id"}))
+
+    df = pr
+    for flag_df, col in [(K, "K"), (D, "D"), (A, "A"), (T, "T")]:
+        if not flag_df.empty:
+            df = df.merge(flag_df[key + [col]], on=key, how="left")
+        else:
+            df[col] = np.nan
+
+    # S = survived (no D entry for this player/round)
+    df["S"] = df["D"].isna().astype(int)
+    for col in ["K", "A", "T", "D"]:
+        df[col] = df[col].fillna(0).astype(int)
+
+    df["kast_round"] = ((df["K"] + df["A"] + df["S"] + df["T"]) > 0).astype(int)
+
+    rounds_per_match = (rounds.groupby("match_id")["round_num"]
+                              .count().reset_index(name="rounds_total"))
+
+    result = (df.groupby(["match_id", "steam_id"])
+                .agg(kast_rounds=("kast_round", "sum"))
+                .reset_index()
+                .merge(rounds_per_match, on="match_id", how="left"))
+
+    result["kast_pct"] = (
+        result["kast_rounds"] / result["rounds_total"].replace(0, 1) * 100
+    ).round(1)
+
+    log.info(f"  ✅ feature_kast: {len(result)} linhas")
+    return result
 
 
 def feature_positioning_zones(ticks: pd.DataFrame, n_zones: int = 10) -> pd.DataFrame:
@@ -510,7 +561,34 @@ def feature_positioning_zones(ticks: pd.DataFrame, n_zones: int = 10) -> pd.Data
     return zone_stats
 
 
-def build_features(data: dict) -> dict:
+def _enrich_kills_teams(kills: pd.DataFrame, economy: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fills attacker_team and victim_team from the economy table when the kills
+    table has them NULL (the extractor does not write those columns).
+    """
+    if kills.empty or economy.empty:
+        return kills
+
+    team_map = (economy[economy["team_label"].isin(["T", "CT"])]
+                [["match_id", "round_num", "steam_id", "team_label"]]
+                .drop_duplicates(subset=["match_id", "round_num", "steam_id"]))
+
+    kills = kills.merge(
+        team_map.rename(columns={"steam_id": "attacker_steam_id", "team_label": "_at"}),
+        on=["match_id", "round_num", "attacker_steam_id"], how="left",
+    )
+    kills["attacker_team"] = kills["attacker_team"].fillna(kills.pop("_at"))
+
+    kills = kills.merge(
+        team_map.rename(columns={"steam_id": "victim_steam_id", "team_label": "_vt"}),
+        on=["match_id", "round_num", "victim_steam_id"], how="left",
+    )
+    kills["victim_team"] = kills["victim_team"].fillna(kills.pop("_vt"))
+
+    return kills
+
+
+def build_features(data: dict, db_path: str = None) -> dict:
     """Constrói todas as features derivadas e retorna dict com DataFrames."""
     log.info("⚙️  Construindo features derivadas...")
 
@@ -518,9 +596,19 @@ def build_features(data: dict) -> dict:
     grenades = data.get("grenades", pd.DataFrame())
     economy  = data.get("economy",  pd.DataFrame())
     rounds   = data.get("rounds",   pd.DataFrame())
-    ticks    = data.get("ticks",    pd.DataFrame())
 
     kills = _compute_trade_kills(kills)
+    kills = _enrich_kills_teams(kills, economy)
+
+    # Sample ticks from DB for positioning zones — never load the full table
+    ticks = pd.DataFrame()
+    if db_path:
+        log.info("  🔀 Amostrando player_ticks para zonas de posicionamento...")
+        ticks = _ticks_sample(
+            db_path,
+            cols=["match_id", "steam_id", "team_label", "tick", "round_num", "pos_x", "pos_y", "hp", "alive"],
+        )
+        ticks = clean_ticks(ticks)
 
     features = {
         **data,
@@ -575,22 +663,44 @@ def normalize(df: pd.DataFrame, cols: list, method: str = "minmax") -> pd.DataFr
 # 5. ORQUESTRADOR PRINCIPAL
 # =============================================================================
 
+FEAT_TABLES = [
+    "feat_kdr", "feat_grenade", "feat_economy_adv",
+    "feat_round_seq", "feat_kast", "feat_zones", "feat_player_master",
+]
+
+
+def save_features(features: dict, db_path: str) -> None:
+    """Persiste todos os DataFrames de feature de volta no banco SQLite."""
+    log.info(f"💾 Salvando features em: {db_path}")
+    con = sqlite3.connect(db_path)
+    try:
+        for name in FEAT_TABLES:
+            df = features.get(name)
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            df.to_sql(name, con, if_exists="replace", index=False)
+            log.info(f"  ✅ {name:<28} {len(df):>8,} linhas")
+    finally:
+        con.close()
+
+
 def prepare_all(db_path: str, normalize_features: bool = True) -> dict:
     """
     Executa pipeline completo de preparação:
-      load → clean → features → (normalização opcional)
+      load → clean → features → (normalização opcional) → salva no SQLite
 
     Retorna dict com todos os DataFrames prontos para EDA e modelagem.
     """
     raw      = load_raw(db_path)
     cleaned  = clean(raw)
-    features = build_features(cleaned)
+    features = build_features(cleaned, db_path=db_path)
 
     if normalize_features and "feat_player_master" in features:
         pm = features["feat_player_master"]
         num_cols = ["kills", "deaths", "kdr", "hs_rate", "kast_pct", "avg_distance"]
         features["feat_player_master"] = normalize(pm, num_cols, method="minmax")
 
+    save_features(features, db_path)
     log.info("✅ Preparação concluída.")
     _print_summary(features)
     return features

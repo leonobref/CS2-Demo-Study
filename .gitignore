@@ -22,6 +22,9 @@ plots/
 *.jpg
 *.pdf
 
+# Exceção: imagens de radar são assets necessários para os heatmaps da EDA
+!assets/maps/*.png
+
 # Python
 __pycache__/
 *.py[cod]

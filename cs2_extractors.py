@@ -468,6 +468,12 @@ def extract_kills(parser: DemoParser, rounds_df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].fillna(0).astype(int)
 
+    # Converte team_num → label de time (2 = T, 3 = CT)
+    if "attacker_team_num" in df.columns:
+        df["attacker_team"] = df["attacker_team_num"].map({2: "T", 3: "CT"})
+    if "victim_team_num" in df.columns:
+        df["victim_team"] = df["victim_team_num"].map({2: "T", 3: "CT"})
+
     log.info(f"  ✅ {len(df)} kills extraídas")
     return df
 

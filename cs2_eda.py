@@ -9,10 +9,14 @@ Visualizações e estatísticas cobertas:
   - Histogramas de distribuição
   - Boxplots por grupo (time, buy_type, round)
   - Scatter plots (ex: equip_value vs win_rate)
-  - Heatmap de posicionamento por mapa (dust2, mirage, nuke) com log-norm
+  - Heatmap de posicionamento por mapa (CT/T) sobreposto ao radar oficial
+  - Heatmap de posicionamento por EQUIPE (FURIA, FaZe, ...) × lado × mapa
   - Heatmap de correlação entre variáveis
   - Distribuição de granadas por tipo e área
   - Vantagem econômica por round
+
+Os heatmaps usam as imagens de radar em assets/maps/ (calibração awpy,
+map-data.json) e amostram player_ticks por `tick % N` — ver _ticks_sample.
 
 Uso:
     python cs2_eda.py cs2.db
@@ -20,7 +24,9 @@ Uso:
 """
 
 import argparse
+import json
 import logging
+import re
 import sqlite3
 import sys
 import warnings
@@ -33,6 +39,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy import stats
+from scipy.ndimage import gaussian_filter
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger("cs2_eda")
@@ -61,6 +68,155 @@ def _setup_style():
 _setup_style()
 
 # =============================================================================
+# RADAR DOS MAPAS — calibração e sobreposição (overlay)
+# =============================================================================
+# Imagens oficiais de radar (1024x1024) e constantes de calibração extraídas do
+# `awpy` (https://awpycs.com), build 17595823. A transformação coordenada-de-jogo
+# → pixel segue a convenção do awpy (game_to_pixel):
+#     x_px = (pos_x - pos_x0) / scale
+#     y_px = (pos_y0 - pos_y) / scale
+# onde (pos_x0, pos_y0) é o canto superior-esquerdo do radar em coordenadas de jogo.
+
+RADAR_DIR = Path(__file__).resolve().parent / "assets" / "maps"
+RADAR_SIZE = 1024  # px (lado da imagem de radar)
+
+# Fallback embutido caso assets/maps/map-data.json não exista.
+_MAP_DATA_FALLBACK = {
+    "de_dust2":    {"pos_x": -2476, "pos_y": 3239, "scale": 4.4},
+    "de_mirage":   {"pos_x": -3230, "pos_y": 1713, "scale": 5.0},
+    "de_nuke":     {"pos_x": -3453, "pos_y": 2887, "scale": 7.0},
+    "de_inferno":  {"pos_x": -2087, "pos_y": 3870, "scale": 4.9},
+    "de_overpass": {"pos_x": -4831, "pos_y": 1781, "scale": 5.2},
+    "de_ancient":  {"pos_x": -2953, "pos_y": 2164, "scale": 5.0},
+    "de_anubis":   {"pos_x": -2796, "pos_y": 3328, "scale": 5.22},
+}
+
+
+def _load_map_data() -> dict:
+    f = RADAR_DIR / "map-data.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return _MAP_DATA_FALLBACK
+
+
+MAP_DATA = _load_map_data()
+_RADAR_CACHE: dict = {}
+_RADAR_GRAY_CACHE: dict = {}
+
+
+def _radar_image(map_name: str):
+    """Carrega (e cacheia) a imagem de radar do mapa; None se ausente."""
+    if map_name in _RADAR_CACHE:
+        return _RADAR_CACHE[map_name]
+    img = None
+    path = RADAR_DIR / f"{map_name}.png"
+    if path.exists():
+        try:
+            img = plt.imread(path)
+        except Exception:
+            img = None
+    _RADAR_CACHE[map_name] = img
+    return img
+
+
+def _radar_grayscale(map_name: str):
+    """Versão esmaecida (tons de cinza, clareada) do radar — fundo discreto que
+    não compete com o heatmap. Cacheada."""
+    if map_name in _RADAR_GRAY_CACHE:
+        return _RADAR_GRAY_CACHE[map_name]
+    img = _radar_image(map_name)
+    out = None
+    if img is not None:
+        arr = np.asarray(img, dtype=float)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        rgb = arr[..., :3]
+        lum = rgb @ np.array([0.2126, 0.7152, 0.0722])
+        # Clareia: aproxima do branco para virar um "mapa de fundo" leve.
+        light = 1.0 - (1.0 - lum) * 0.35
+        out = np.dstack([light, light, light, np.ones_like(light)])
+    _RADAR_GRAY_CACHE[map_name] = out
+    return out
+
+
+def _map_extent_game(map_name: str):
+    """Extensão do radar em coordenadas de jogo: (x_min, x_max, y_min, y_max)."""
+    md = MAP_DATA[map_name]
+    x0 = md["pos_x"]
+    x1 = md["pos_x"] + RADAR_SIZE * md["scale"]
+    y_top = md["pos_y"]
+    y_bot = md["pos_y"] - RADAR_SIZE * md["scale"]
+    return x0, x1, y_bot, y_top
+
+
+def _draw_heat_overlay(ax, map_name: str, x: np.ndarray, y: np.ndarray,
+                       cmap: str, bins: int = 160, sigma: float = 2.6,
+                       alpha: float = 0.85, gamma: float = 0.38,
+                       mask_frac: float = 0.012):
+    """
+    Heatmap de densidade (histograma 2D suavizado por filtro gaussiano) plotado
+    em um gráfico X–Y (coordenadas de jogo), com a imagem de radar esmaecida ao
+    fundo para referência espacial.
+
+    - `gamma` < 1 (PowerNorm) realça regiões de baixo tráfego (maior alcance).
+    - `mask_frac` baixo deixa mais áreas visíveis; só zera o fundo "vazio".
+    Retorna o número de pontos plotados dentro da moldura do mapa.
+    """
+    md = MAP_DATA.get(map_name)
+    if md is None:
+        # Sem calibração: cai para um gráfico X–Y puro.
+        x = np.asarray(x); y = np.asarray(y)
+        if len(x):
+            H, xe, ye = np.histogram2d(x, y, bins=bins)
+            H = gaussian_filter(H.T, sigma=sigma)
+            Hm = np.ma.masked_where(H < H.max() * mask_frac, H)
+            ax.imshow(Hm, extent=[xe[0], xe[-1], ye[0], ye[-1]], origin="lower",
+                      cmap=cmap, norm=mcolors.PowerNorm(gamma), alpha=alpha,
+                      interpolation="bilinear")
+        ax.set_xlabel("Posição X"); ax.set_ylabel("Posição Y")
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.25, linewidth=0.5)
+        return int(len(x))
+
+    x0, x1, y0, y1 = _map_extent_game(map_name)
+    extent = [x0, x1, y0, y1]
+
+    gray = _radar_grayscale(map_name)
+    if gray is not None:
+        ax.imshow(gray, extent=extent, origin="upper", zorder=1,
+                  interpolation="bilinear")
+
+    x = np.asarray(x); y = np.asarray(y)
+    m = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+    x, y = x[m], y[m]
+
+    if len(x):
+        H, _, _ = np.histogram2d(x, y, bins=bins, range=[[x0, x1], [y0, y1]])
+        H = gaussian_filter(H.T, sigma=sigma)  # .T → [linha=y, coluna=x]
+        if H.max() > 0:
+            Hm = np.ma.masked_where(H < H.max() * mask_frac, H)
+            ax.imshow(Hm, extent=extent, origin="lower", cmap=cmap,
+                      alpha=alpha, norm=mcolors.PowerNorm(gamma),
+                      interpolation="bilinear", zorder=2)
+
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Posição X")
+    ax.set_ylabel("Posição Y")
+    ax.grid(True, alpha=0.22, linewidth=0.5, zorder=3)
+    ax.set_axisbelow(False)
+    return int(m.sum())
+
+
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(s)).strip("_")
+
+
+# =============================================================================
 # UTILITÁRIOS
 # =============================================================================
 
@@ -85,11 +241,41 @@ def load_db(db_path: str, match_id: int = None) -> dict:
         except Exception:
             data[t] = pd.DataFrame()
     con.close()
+
+    # attacker_team/victim_team podem estar vazios no banco (bug de extração).
+    # Reconstrói a partir da tabela economy via steam_id + round.
+    kills = data.get("kills", pd.DataFrame())
+    economy = data.get("economy", pd.DataFrame())
+    if (not kills.empty and not economy.empty
+            and "attacker_team" in kills.columns
+            and kills["attacker_team"].replace("", np.nan).isna().any()):
+        kills["attacker_team"] = kills["attacker_team"].replace("", np.nan)
+        kills["victim_team"]   = kills["victim_team"].replace("", np.nan)
+        team_map = (economy[economy["team_label"].isin(["T", "CT"])]
+                    [["match_id", "round_num", "steam_id", "team_label"]]
+                    .drop_duplicates(subset=["match_id", "round_num", "steam_id"]))
+        kills = kills.merge(
+            team_map.rename(columns={"steam_id": "attacker_steam_id", "team_label": "_at"}),
+            on=["match_id", "round_num", "attacker_steam_id"], how="left",
+        )
+        kills["attacker_team"] = kills["attacker_team"].fillna(kills.pop("_at"))
+        kills = kills.merge(
+            team_map.rename(columns={"steam_id": "victim_steam_id", "team_label": "_vt"}),
+            on=["match_id", "round_num", "victim_steam_id"], how="left",
+        )
+        kills["victim_team"] = kills["victim_team"].fillna(kills.pop("_vt"))
+        data["kills"] = kills
+
     return data
 
 
 def _ticks_sample(db_path: str, cols: list, match_id: int = None, n: int = 500_000) -> pd.DataFrame:
-    """Sample ~n alive rows from player_ticks via rowid-modulo — no full-table sort."""
+    """Sample ~n alive rows from player_ticks via tick-modulo — no full-table sort.
+
+    Sampling on `tick` (not `rowid`) keeps every player represented: each tick has
+    one row per player, so `tick % step = 0` selects whole snapshots uniformly.
+    `rowid % step` would alias the 10-player-per-tick layout and silently drop
+    entire teams when step is a multiple of 10."""
     filt = f" AND match_id = {match_id}" if match_id else ""
     col_str = ", ".join(cols)
     con = sqlite3.connect(db_path)
@@ -107,7 +293,7 @@ def _ticks_sample(db_path: str, cols: list, match_id: int = None, n: int = 500_0
             step = max(1, total // n)
             df = pd.read_sql(
                 f"SELECT {col_str} FROM player_ticks"
-                f" WHERE rowid % {step} = 0 AND alive = 1{filt}"
+                f" WHERE tick % {step} = 0 AND alive = 1{filt}"
                 f" LIMIT {n}",
                 con,
             )
@@ -233,28 +419,29 @@ def plot_distributions(data: dict, output_dir: Path = None):
         for team, color in [("CT", CT_COLOR), ("T", T_COLOR)]:
             vals = econ[econ["team_label"] == team]["equip_value"].dropna()
             ax.hist(vals, bins=30, color=color, alpha=0.6, label=team, edgecolor="white")
-        ax.set_xlabel("Valor do equipamento (R$)")
+        ax.set_xlabel("Valor do equipamento ($)")
         ax.set_ylabel("Frequência")
         ax.set_title("Equipamento por time")
         ax.legend()
 
-    # 4. Kills por round
-    ax = axes[1, 0]
-    if not kills.empty and "round_num" in kills.columns:
-        kpr = kills.groupby("round_num").size()
-        ax.hist(kpr.values, bins=15, color="#6C8EBF", edgecolor="white", linewidth=0.5)
-        ax.axvline(kpr.mean(), color="red", linestyle="--", linewidth=1.2,
-                   label=f"Média {kpr.mean():.1f}")
-        ax.set_xlabel("Kills por round")
-        ax.set_ylabel("Frequência de rounds")
-        ax.set_title("Distribuição de kills/round")
-        ax.legend(fontsize=8)
+    # 4. (vazio)
+    axes[1, 0].axis("off")
 
     # 5. Tipo de compra por time
     ax = axes[1, 1]
     if not econ.empty and "buy_type" in econ.columns and "team_label" in econ.columns:
-        buy_dist = econ.groupby(["team_label", "buy_type"]).size().unstack(fill_value=0)
-        buy_dist.plot(kind="bar", ax=ax, color=["#7C8FA6","#E8543A","#4A90D9","#5BA85C"],
+        BUY_ORDER   = ["eco", "force_buy", "half_buy", "full_buy"]
+        BUY_COLORS  = ["#7C8FA6", "#E8543A", "#4A90D9", "#5BA85C"]
+        econ_plot = econ[econ["team_label"].isin(["T", "CT"]) &
+                         econ["buy_type"].isin(BUY_ORDER)]
+        # buy_type é por jogador; agrupa por round-time e pega o mais frequente
+        econ_dedup = (econ_plot.groupby(["match_id", "round_num", "team_label"])["buy_type"]
+                               .agg(lambda x: x.mode().iloc[0])
+                               .reset_index())
+        buy_dist = (econ_dedup.groupby(["team_label", "buy_type"]).size()
+                              .unstack(fill_value=0)
+                              .reindex(columns=BUY_ORDER, fill_value=0))
+        buy_dist.plot(kind="bar", ax=ax, color=BUY_COLORS,
                       edgecolor="white", width=0.7)
         ax.set_xlabel("Time")
         ax.set_ylabel("Rounds")
@@ -321,7 +508,7 @@ def plot_boxplots(data: dict, output_dir: Path = None, db_path: str = None, matc
                     order=order, palette=dict(zip(order, colors)),
                     ax=ax, width=0.5, fliersize=2, linewidth=0.8)
         ax.set_xlabel("Tipo de compra")
-        ax.set_ylabel("Valor do equipamento (R$)")
+        ax.set_ylabel("Valor do equipamento ($)")
         ax.set_title("Equipamento por tipo de compra")
         ax.set_xticklabels(["Eco","Force","Half","Full"], rotation=0)
 
@@ -444,14 +631,12 @@ def plot_scatter(data: dict, output_dir: Path = None):
     """Scatter plots de relações chave."""
     log.info("🔵 Gerando scatter plots...")
 
-    kills = data.get("kills", pd.DataFrame())
     econ  = data.get("economy", pd.DataFrame())
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
     fig.suptitle("Scatter Plots", fontsize=14, fontweight="bold")
 
     # 1. Equip CT vs Equip T (colorido por vencedor)
-    ax = axes[0]
     rounds = data.get("rounds", pd.DataFrame())
     if not econ.empty and not rounds.empty:
         ct = econ[econ["team_label"]=="CT"].groupby(["match_id","round_num"])["equip_value"].sum().reset_index(name="ct_equip")
@@ -466,31 +651,12 @@ def plot_scatter(data: dict, output_dir: Path = None):
         ax.plot([0, merged[["t_equip","ct_equip"]].max().max()],
                 [0, merged[["t_equip","ct_equip"]].max().max()],
                 color="gray", linestyle="--", linewidth=0.8, label="Paridade")
-        ax.set_xlabel("Equipamento T (R$)")
-        ax.set_ylabel("Equipamento CT (R$)")
+        ax.set_xlabel("Equipamento T ($)")
+        ax.set_ylabel("Equipamento CT ($)")
         ax.set_title("Equip CT vs T por round")
         patches = [mpatches.Patch(color=CT_COLOR, label="CT vence"),
                    mpatches.Patch(color=T_COLOR,  label="T vence")]
         ax.legend(handles=patches, fontsize=8)
-
-    # 2. Distância vs Headshot (por time)
-    ax = axes[1]
-    if not kills.empty and "distance" in kills.columns and "headshot" in kills.columns:
-        sample = kills[kills["attacker_team"].isin(["T","CT"])].dropna(subset=["distance","headshot"])
-        if len(sample) > 2000:
-            sample = sample.sample(2000, random_state=42)
-        colors = sample["attacker_team"].map(PALETTE)
-        jitter = np.random.uniform(-0.02, 0.02, len(sample))
-        ax.scatter(sample["distance"], sample["headshot"] + jitter,
-                   c=colors, alpha=0.3, s=15, edgecolors="none")
-        ax.set_xlabel("Distância (unidades)")
-        ax.set_ylabel("Headshot (1=sim, 0=não)")
-        ax.set_title("Distância vs Headshot")
-        patches = [mpatches.Patch(color=PALETTE["CT"], label="CT"),
-                   mpatches.Patch(color=PALETTE["T"],  label="T")]
-        ax.legend(handles=patches, fontsize=8)
-        ax.set_yticks([0, 1])
-        ax.set_yticklabels(["Não", "Sim"])
 
     plt.tight_layout()
     _save(fig, output_dir, "04_scatter")
@@ -597,7 +763,7 @@ def plot_positioning_heatmap(db_path: str, team: str = "CT",
             step = max(1, total // n)
             df = pd.read_sql(
                 f"SELECT pos_x, pos_y FROM player_ticks"
-                f" WHERE rowid % {step} = 0 AND {where}"
+                f" WHERE tick % {step} = 0 AND {where}"
                 f" LIMIT {n}",
                 con,
             )
@@ -661,10 +827,11 @@ def _map_display_name(map_name: str) -> str:
 
 def plot_map_heatmaps(db_path: str, output_dir: Path = None):
     """
-    Heatmap de posicionamento 2D por mapa, separado por time.
+    Heatmap de posicionamento 2D por mapa, separado por lado (CT/T),
+    sobreposto à imagem oficial de radar do mapa.
     Gera um heatmap para cada mapa presente no banco de dados.
     """
-    log.info("🗺  Gerando heatmaps por mapa...")
+    log.info("🗺  Gerando heatmaps por mapa (overlay no radar)...")
 
     con = sqlite3.connect(db_path)
     # step=20 → ~5 % sample; keeps each map under ~500 K rows even with 100 M total ticks
@@ -675,7 +842,8 @@ def plot_map_heatmaps(db_path: str, output_dir: Path = None):
         WHERE pt.alive = 1
           AND pt.pos_x IS NOT NULL
           AND pt.pos_y IS NOT NULL
-          AND pt.rowid % 20 = 0
+          AND pt.team_label IN ('T', 'CT')
+          AND pt.tick % 20 = 0
     """, con)
     con.close()
 
@@ -694,43 +862,99 @@ def plot_map_heatmaps(db_path: str, output_dir: Path = None):
         map_df = df[df["map_name"] == map_name]
         display = _map_display_name(map_name)
 
-        # Bounds from data, clipping extreme outliers
-        x_lo, x_hi = map_df["pos_x"].quantile([0.002, 0.998])
-        y_lo, y_hi = map_df["pos_y"].quantile([0.002, 0.998])
+        fig, axes = plt.subplots(1, 2, figsize=(13, 6.8))
+        fig.suptitle(f"Heatmap de Posicionamento — {display}",
+                     fontsize=14, fontweight="bold")
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(f"Heatmap de Posicionamento — {display}", fontsize=14, fontweight="bold")
-
-        teams = [("CT", "Blues"), ("T", "Reds")]
-        for ax, (team, cmap) in zip(axes, teams):
+        for ax, (team, cmap) in zip(axes, [("CT", "Blues"), ("T", "Reds")]):
             team_df = map_df[map_df["team_label"] == team]
-
-            if team_df.empty:
-                ax.set_title(f"{team} — sem dados")
-                ax.axis("off")
-                continue
-
-            if len(team_df) > 200_000:
-                team_df = team_df.sample(200_000, random_state=42)
-
-            counts, xedges, yedges, img = ax.hist2d(
-                team_df["pos_x"], team_df["pos_y"],
-                bins=100,
-                range=[[x_lo, x_hi], [y_lo, y_hi]],
-                cmap=cmap,
-                norm=mcolors.LogNorm(),
-            )
-            fig.colorbar(img, ax=ax, label="Ticks (log)")
-
-            ax.set_title(f"Time {team}  ({len(team_df):,} ticks)", fontsize=11)
-            ax.set_xlabel("Posição X")
-            ax.set_ylabel("Posição Y")
-            ax.set_aspect("equal")
+            n = _draw_heat_overlay(ax, map_name,
+                                   team_df["pos_x"].to_numpy(),
+                                   team_df["pos_y"].to_numpy(),
+                                   cmap=cmap)
+            ax.set_title(f"Lado {team}  ({n:,} ticks)", fontsize=11,
+                         color=CT_COLOR if team == "CT" else T_COLOR)
 
         plt.tight_layout()
         fname = f"09_heatmap_{map_name}"
         _save(fig, output_dir, fname)
         log.info(f"  ✅ {display}: {len(map_df):,} ticks plotados")
+
+
+# =============================================================================
+# 9. HEATMAP DE POSICIONAMENTO POR EQUIPE (FURIA, FaZe, ...) × LADO × MAPA
+# =============================================================================
+
+def plot_team_map_heatmaps(db_path: str, output_dir: Path = None,
+                           sample_step: int = 40):
+    """
+    Heatmap de posicionamento por equipe real (team_name de match_players),
+    separado por lado (CT/T) e por mapa, sobreposto ao radar oficial.
+
+    Cada figura corresponde a uma combinação (equipe, mapa) e contém dois
+    painéis: o posicionamento da equipe quando jogou de CT e quando jogou de T.
+    O lado é o lado *vivo* no tick (player_ticks.team_label); a equipe é
+    constante na partida (match_players.team_name).
+
+    Os arquivos são salvos em <output_dir>/teams/<EQUIPE>/<mapa>.png.
+    """
+    log.info("🗺  Gerando heatmaps por EQUIPE (overlay no radar)...")
+
+    con = sqlite3.connect(db_path)
+    df = pd.read_sql(f"""
+        SELECT pt.pos_x        AS x,
+               pt.pos_y        AS y,
+               pt.team_label   AS side,
+               mt.map_name     AS map,
+               mp.team_name    AS team
+        FROM player_ticks pt
+        JOIN matches       mt ON mt.id = pt.match_id
+        JOIN match_players mp ON mp.match_id = pt.match_id
+                             AND mp.steam_id = pt.steam_id
+        WHERE pt.alive = 1
+          AND pt.pos_x IS NOT NULL
+          AND pt.pos_y IS NOT NULL
+          AND pt.team_label IN ('T', 'CT')
+          AND mp.team_name IS NOT NULL
+          AND pt.tick % {sample_step} = 0
+    """, con)
+    con.close()
+
+    if df.empty:
+        log.warning("  Sem dados de posicionamento por equipe.")
+        return
+
+    teams = sorted(df["team"].dropna().unique())
+    log.info(f"  Equipes: {', '.join(teams)}")
+
+    for team in teams:
+        team_df = df[df["team"] == team]
+        team_dir = (output_dir / "teams" / _safe_name(team)) if output_dir else None
+        if team_dir:
+            team_dir.mkdir(parents=True, exist_ok=True)
+        maps = sorted(team_df["map"].dropna().unique())
+        for map_name in maps:
+            md = team_df[team_df["map"] == map_name]
+            display = _map_display_name(map_name)
+
+            fig, axes = plt.subplots(1, 2, figsize=(13, 6.8))
+            fig.suptitle(f"Posicionamento — {team} em {display}",
+                         fontsize=14, fontweight="bold")
+
+            for ax, (side, cmap) in zip(axes, [("CT", "Blues"), ("T", "Reds")]):
+                sdf = md[md["side"] == side]
+                n = _draw_heat_overlay(ax, map_name,
+                                       sdf["x"].to_numpy(), sdf["y"].to_numpy(),
+                                       cmap=cmap)
+                label = f"{team} como {side}  ({n:,} ticks)"
+                if n == 0:
+                    label = f"{team} como {side} — sem dados"
+                ax.set_title(label, fontsize=11,
+                             color=CT_COLOR if side == "CT" else T_COLOR)
+
+            plt.tight_layout()
+            _save(fig, team_dir, map_name)
+            log.info(f"  ✅ {team} / {display}: {len(md):,} ticks")
 
 
 # =============================================================================
@@ -759,7 +983,7 @@ def plot_economy_timeline(data: dict, output_dir: Path = None):
     if "T" in econ_round.columns:
         ax.fill_between(econ_round.index, econ_round["T"], alpha=0.3, color=T_COLOR)
         ax.plot(econ_round.index, econ_round["T"], color=T_COLOR, linewidth=2, label="T")
-    ax.set_ylabel("Equipamento total (R$)")
+    ax.set_ylabel("Equipamento total ($)")
     ax.set_title("Valor de equipamento por time")
     ax.legend()
 
@@ -776,7 +1000,7 @@ def plot_economy_timeline(data: dict, output_dir: Path = None):
         colors = [CT_COLOR if v >= 0 else T_COLOR for v in adv]
         ax.bar(adv.index, adv.values, color=colors, edgecolor="white", linewidth=0.3)
         ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_ylabel("Vantagem CT (R$)")
+        ax.set_ylabel("Vantagem CT ($)")
         ax.set_title("Vantagem econômica relativa (CT − T)")
         ax.set_xlabel("Round")
 
@@ -836,6 +1060,11 @@ def plot_win_rates(data: dict, output_dir: Path = None):
         merged = econ.merge(rounds[["match_id","round_num","winner_team"]],
                             on=["match_id","round_num"], how="left")
         merged["won"] = (merged["team_label"] == merged["winner_team"]).astype(int)
+        # buy_type é por jogador; deduplica para um registro por round-time
+        merged = (merged.groupby(["match_id", "round_num", "team_label"])
+                        .agg(buy_type=("buy_type", lambda x: x.mode().iloc[0]),
+                             won=("won", "first"))
+                        .reset_index())
         wr_buy = merged.groupby("buy_type")["won"].mean() * 100
         order  = ["eco","force_buy","half_buy","full_buy"]
         wr_buy = wr_buy.reindex([o for o in order if o in wr_buy.index])
@@ -888,9 +1117,8 @@ def run_eda(db_path: str, match_id: int = None, output_dir: str = None):
     plot_correlation(data, out)
     plot_scatter(data, out)
     plot_grenades(data, out)
-    plot_positioning_heatmap(db_path, team="CT", match_id=match_id, output_dir=out)
-    plot_positioning_heatmap(db_path, team="T",  match_id=match_id, output_dir=out)
     plot_map_heatmaps(db_path, out)
+    plot_team_map_heatmaps(db_path, out)
     plot_economy_timeline(data, out)
     plot_win_rates(data, out)
 
