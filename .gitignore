@@ -4,6 +4,8 @@
 
 # Banco de dados
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *.db.bak-*
@@ -59,3 +61,6 @@ desktop.ini
 # Logs
 *.log
 logs/
+# Resultados e datasets gerados
+results/
+datasets/
