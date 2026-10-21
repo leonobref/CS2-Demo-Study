@@ -89,6 +89,7 @@ _MAP_DATA_FALLBACK = {
     "de_overpass": {"pos_x": -4831, "pos_y": 1781, "scale": 5.2},
     "de_ancient":  {"pos_x": -2953, "pos_y": 2164, "scale": 5.0},
     "de_anubis":   {"pos_x": -2796, "pos_y": 3328, "scale": 5.22},
+    "de_cache":    {"pos_x": -2000, "pos_y": 3250, "scale": 5.5},
 }
 
 
